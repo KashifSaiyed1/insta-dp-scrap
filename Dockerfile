@@ -1,26 +1,31 @@
-# 1. Use the official Playwright Python image (it includes all dependencies)
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+# 1. Use the official Playwright image that matches your requirements.txt version
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
-# 2. Set environment variables
+# 2. Set environment variables for Render compatibility and memory efficiency
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PORT=10000
 
+# 3. Set the working directory
 WORKDIR /app
 
-# 3. Install Python dependencies
+# 4. Install Python dependencies first (for better build caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 4. Install ONLY Chromium (Skip Firefox/Webkit to save space)
-# Note: The dependencies are already in the base image!
+# 5. Install the Chromium browser binary
+# This base image already contains the system dependencies (libs)
 RUN playwright install chromium
 
-# 5. Copy your app code
+# 6. Copy the application code
 COPY main.py .
+
+# 7. Create the storage directory for profile photos
 RUN mkdir -p profile_photos
 
+# 8. Expose the port Render expects
 EXPOSE 10000
 
-# 6. Start the app
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# 9. Start the application with a single worker to save RAM on the Free Tier
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1"]
