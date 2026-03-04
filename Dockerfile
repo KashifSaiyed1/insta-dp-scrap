@@ -31,8 +31,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright Chromium browser
-RUN playwright install chromium
+# Install Playwright Chromium browser using python -m
+RUN python -m playwright install chromium
+RUN python -m playwright install-deps chromium
 
 # Copy app code
 COPY main.py .
