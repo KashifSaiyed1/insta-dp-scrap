@@ -1,3 +1,5 @@
 fastapi
 uvicorn[standard]
-instaloader
+requests
+beautifulsoup4
+
