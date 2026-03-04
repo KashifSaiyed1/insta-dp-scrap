@@ -1,12 +1,12 @@
 """
 Instagram Profile Photo Downloader - FastAPI Backend
 =====================================================
-Deployable on Render.com as a Web Service
+With Instagram session login to avoid 429 rate limits on cloud IPs
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 import instaloader
 import os
 import shutil
@@ -14,10 +14,9 @@ import shutil
 app = FastAPI(
     title="Instagram Profile Photo Downloader",
     description="Fetch profile photo & stats of any public Instagram account",
-    version="1.0.0",
+    version="1.1.0",
 )
 
-# Allow all origins (update this for production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,10 +28,17 @@ app.add_middleware(
 SAVE_DIR = "profile_photos"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+# --- Global loader with session ---
+loader = None
+
 
 def get_loader():
-    """Create a fresh Instaloader instance."""
-    return instaloader.Instaloader(
+    """Create and cache a logged-in Instaloader instance."""
+    global loader
+    if loader is not None:
+        return loader
+
+    loader = instaloader.Instaloader(
         download_pictures=False,
         download_videos=False,
         download_video_thumbnails=False,
@@ -42,12 +48,33 @@ def get_loader():
         compress_json=False,
     )
 
+    # Login with credentials from environment variables
+    ig_user = os.environ.get("IG_USERNAME")
+    ig_pass = os.environ.get("IG_PASSWORD")
+
+    if ig_user and ig_pass:
+        try:
+            loader.login(ig_user, ig_pass)
+            print(f"✅ Logged in as @{ig_user}")
+        except Exception as e:
+            print(f"⚠️ Login failed: {e}. Running without login.")
+    else:
+        print("⚠️ No IG credentials found. Running without login (may get rate-limited).")
+
+    return loader
+
+
+@app.on_event("startup")
+def startup():
+    """Login on app startup so session is ready."""
+    get_loader()
+
 
 @app.get("/")
 def root():
     return {
         "message": "Instagram Profile Photo Downloader API",
-        "usage": "GET /profile/{username} for stats + photo URL",
+        "usage": "GET /profile/{username}",
         "docs": "Visit /docs for Swagger UI",
     }
 
@@ -57,19 +84,18 @@ def get_profile(username: str):
     """Fetch profile stats and download the profile photo."""
 
     username = username.strip().lstrip("@").lower()
-
     if not username:
         raise HTTPException(status_code=400, detail="Username cannot be empty")
 
-    loader = get_loader()
+    L = get_loader()
 
     try:
-        profile = instaloader.Profile.from_username(loader.context, username)
+        profile = instaloader.Profile.from_username(L.context, username)
 
         # Download profile pic
-        loader.download_profilepic(profile)
+        L.download_profilepic(profile)
 
-        # Move to our save directory
+        # Move to save directory
         saved_path = None
         src_folder = username
         if os.path.exists(src_folder):
@@ -80,7 +106,6 @@ def get_profile(username: str):
                     shutil.move(src_path, dest_path)
                     saved_path = dest_path
                     break
-            # Clean up auto-created folder
             shutil.rmtree(src_folder, ignore_errors=True)
 
         return {
@@ -100,7 +125,7 @@ def get_profile(username: str):
     except instaloader.exceptions.ProfileNotExistsException:
         raise HTTPException(status_code=404, detail=f"Profile '@{username}' does not exist")
     except instaloader.exceptions.ConnectionException as e:
-        raise HTTPException(status_code=429, detail=f"Rate limited by Instagram. Try again later. {str(e)}")
+        raise HTTPException(status_code=429, detail=f"Rate limited by Instagram: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -127,4 +152,5 @@ def download_photo(username: str):
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    logged_in = os.environ.get("IG_USERNAME") is not None
+    return {"status": "healthy", "instagram_login": logged_in}
