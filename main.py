@@ -1,25 +1,24 @@
 """
-Instagram Profile Photo Downloader - FastAPI Backend v2
+Instagram Profile Photo Downloader - FastAPI Backend v3
 ========================================================
-Uses requests + BeautifulSoup instead of instaloader.
-Mimics a real browser to avoid Instagram's bot detection.
+Performs actual Instagram web login to get session cookies,
+then fetches profile data as an authenticated user.
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import requests
-import re
 import json
 import os
-import shutil
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+import re
+import time
+import hashlib
 
 app = FastAPI(
     title="Instagram Profile Photo Downloader",
     description="Fetch profile photo & stats of any public Instagram account",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -33,145 +32,269 @@ app.add_middleware(
 SAVE_DIR = "profile_photos"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# --- Browser-like headers to avoid bot detection ---
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-    "Cache-Control": "max-age=0",
-}
+# ============================================================
+# Instagram Session Manager
+# ============================================================
 
-# Persistent session to maintain cookies across requests
-session = requests.Session()
-session.headers.update(HEADERS)
+class InstagramSession:
+    """Manages authenticated Instagram web session."""
 
+    BASE_URL = "https://www.instagram.com"
+    LOGIN_URL = "https://www.instagram.com/accounts/login/ajax/"
+    USER_AGENT = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
 
-def extract_profile_data(username: str) -> dict:
-    """
-    Fetch Instagram profile page and extract data from:
-    1. og:image meta tag (profile pic)
-    2. Embedded JSON in <script> tags (stats)
-    """
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": self.USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        })
+        self.logged_in = False
+        self.login_username = None
 
-    url = f"https://www.instagram.com/{username}/"
-
-    # First hit the homepage to get cookies (csrftoken, mid, ig_did etc.)
-    try:
-        session.get("https://www.instagram.com/", timeout=10)
-    except Exception:
-        pass
-
-    response = session.get(url, timeout=15)
-
-    if response.status_code == 404:
-        raise HTTPException(status_code=404, detail=f"Profile '@{username}' does not exist")
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=f"Instagram returned status {response.status_code}",
-        )
-
-    html = response.text
-    soup = BeautifulSoup(html, "html.parser")
-
-    # --- Extract profile pic from og:image ---
-    profile_pic_url = None
-    og_image = soup.find("meta", property="og:image")
-    if og_image:
-        profile_pic_url = og_image.get("content")
-
-    # --- Extract description (has follower counts) from og:description ---
-    description = ""
-    og_desc = soup.find("meta", property="og:description")
-    if og_desc:
-        description = og_desc.get("content", "")
-
-    # --- Try to extract full name from title ---
-    full_name = ""
-    title_tag = soup.find("meta", property="og:title")
-    if title_tag:
-        title_text = title_tag.get("content", "")
-        # Format: "Full Name (@username) • Instagram photos and videos"
-        match = re.match(r"^(.*?)\s*\(@", title_text)
-        if match:
-            full_name = match.group(1).strip()
-
-    # --- Parse follower/following/posts from description ---
-    # Format: "1.2M Followers, 500 Following, 300 Posts - See Instagram..."
-    followers = 0
-    following = 0
-    posts = 0
-
-    followers_match = re.search(r"([\d,.]+[KMB]?)\s*Followers", description, re.IGNORECASE)
-    following_match = re.search(r"([\d,.]+[KMB]?)\s*Following", description, re.IGNORECASE)
-    posts_match = re.search(r"([\d,.]+[KMB]?)\s*Posts", description, re.IGNORECASE)
-
-    if followers_match:
-        followers = parse_count(followers_match.group(1))
-    if following_match:
-        following = parse_count(following_match.group(1))
-    if posts_match:
-        posts = parse_count(posts_match.group(1))
-
-    # --- Try to extract more data from embedded JSON ---
-    bio = ""
-    is_private = False
-    is_verified = False
-
-    for script in soup.find_all("script", type="application/ld+json"):
+    def login(self, username: str, password: str) -> bool:
+        """Perform Instagram web login and store session cookies."""
         try:
-            data = json.loads(script.string)
-            if isinstance(data, dict):
-                if "description" in data:
-                    bio = data.get("description", "")
-                if "name" in data and not full_name:
-                    full_name = data.get("name", "")
-        except (json.JSONDecodeError, TypeError):
-            pass
+            # Step 1: Visit Instagram homepage to get initial cookies (csrftoken, mid)
+            print("🔑 Step 1: Fetching Instagram homepage for cookies...")
+            resp = self.session.get(self.BASE_URL, timeout=15)
+            time.sleep(1)
 
-    # Also search for SharedData or similar JSON blobs
-    for script in soup.find_all("script"):
-        if script.string and "is_private" in (script.string or ""):
-            try:
-                # Look for JSON objects with profile data
-                json_match = re.search(r'\{[^{}]*"is_private"\s*:\s*(true|false)[^{}]*\}', script.string)
-                if json_match:
-                    is_private = json_match.group(1) == "true"
-                verified_match = re.search(r'"is_verified"\s*:\s*(true|false)', script.string)
-                if verified_match:
-                    is_verified = verified_match.group(1) == "true"
-            except Exception:
-                pass
+            # Get CSRF token from cookies
+            csrf_token = self.session.cookies.get("csrftoken", "")
+            if not csrf_token:
+                # Try to extract from page source
+                match = re.search(r'"csrf_token":"([^"]+)"', resp.text)
+                if match:
+                    csrf_token = match.group(1)
 
-    if not profile_pic_url:
-        raise HTTPException(
-            status_code=500,
-            detail="Could not extract profile picture. Instagram may have blocked this request.",
-        )
+            if not csrf_token:
+                print("❌ Could not get CSRF token")
+                return False
 
-    return {
-        "username": username,
-        "full_name": full_name,
-        "bio": bio,
-        "followers": followers,
-        "following": following,
-        "posts": posts,
-        "is_private": is_private,
-        "is_verified": is_verified,
-        "profile_pic_url": profile_pic_url,
-    }
+            print(f"✅ Got CSRF token: {csrf_token[:10]}...")
+
+            # Step 2: Send login request
+            print("🔑 Step 2: Logging in...")
+            timestamp = int(time.time())
+
+            login_data = {
+                "username": username,
+                "enc_password": f"#PWD_INSTAGRAM_BROWSER:0:{timestamp}:{password}",
+                "queryParams": "{}",
+                "optIntoOneTap": "false",
+                "trustedDeviceRecords": "{}",
+            }
+
+            login_headers = {
+                "X-CSRFToken": csrf_token,
+                "X-Requested-With": "XMLHttpRequest",
+                "X-Instagram-AJAX": "1",
+                "Referer": "https://www.instagram.com/accounts/login/",
+                "Origin": "https://www.instagram.com",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+
+            resp = self.session.post(
+                self.LOGIN_URL,
+                data=login_data,
+                headers=login_headers,
+                timeout=15,
+            )
+
+            result = resp.json()
+            print(f"📦 Login response: {json.dumps(result, indent=2)}")
+
+            if result.get("authenticated"):
+                self.logged_in = True
+                self.login_username = username
+                print(f"✅ Successfully logged in as @{username}")
+                return True
+            else:
+                msg = result.get("message", "Unknown error")
+                print(f"❌ Login failed: {msg}")
+                # Check for checkpoint/challenge
+                if result.get("checkpoint_url"):
+                    print(f"⚠️ Account needs verification: {result['checkpoint_url']}")
+                return False
+
+        except Exception as e:
+            print(f"❌ Login error: {e}")
+            return False
+
+    def get_profile_data(self, username: str) -> dict:
+        """Fetch profile data using the authenticated session."""
+
+        # Method 1: Try the web profile info API (works when logged in)
+        try:
+            return self._fetch_via_api(username)
+        except Exception as e:
+            print(f"⚠️ API method failed: {e}")
+
+        # Method 2: Try the GraphQL endpoint
+        try:
+            return self._fetch_via_graphql(username)
+        except Exception as e:
+            print(f"⚠️ GraphQL method failed: {e}")
+
+        # Method 3: Fallback to HTML parsing
+        try:
+            return self._fetch_via_html(username)
+        except Exception as e:
+            print(f"⚠️ HTML method failed: {e}")
+
+        raise Exception("All methods failed to fetch profile data")
+
+    def _fetch_via_api(self, username: str) -> dict:
+        """Fetch via Instagram's web profile info API."""
+        url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+
+        headers = {
+            "User-Agent": self.USER_AGENT,
+            "X-IG-App-ID": "936619743392459",  # Instagram web app ID
+            "X-IG-WWW-Claim": "0",
+            "Origin": "https://www.instagram.com",
+            "Referer": f"https://www.instagram.com/{username}/",
+        }
+
+        resp = self.session.get(url, headers=headers, timeout=15)
+
+        if resp.status_code == 429:
+            raise Exception("Rate limited on API endpoint")
+        if resp.status_code != 200:
+            raise Exception(f"API returned {resp.status_code}")
+
+        data = resp.json()
+        user = data.get("data", {}).get("user", {})
+
+        if not user:
+            raise Exception("No user data in API response")
+
+        return {
+            "username": username,
+            "full_name": user.get("full_name", ""),
+            "bio": user.get("biography", ""),
+            "followers": user.get("edge_followed_by", {}).get("count", 0),
+            "following": user.get("edge_follow", {}).get("count", 0),
+            "posts": user.get("edge_owner_to_timeline_media", {}).get("count", 0),
+            "is_private": user.get("is_private", False),
+            "is_verified": user.get("is_verified", False),
+            "profile_pic_url": user.get("profile_pic_url_hd", user.get("profile_pic_url", "")),
+        }
+
+    def _fetch_via_graphql(self, username: str) -> dict:
+        """Fetch via Instagram's GraphQL endpoint."""
+        url = "https://www.instagram.com/graphql/query/"
+
+        variables = json.dumps({
+            "username": username,
+            "render_surface": "PROFILE",
+        })
+
+        params = {
+            "doc_id": "7950326498356165",  # Public profile query doc_id
+            "variables": variables,
+        }
+
+        headers = {
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"https://www.instagram.com/{username}/",
+        }
+
+        resp = self.session.get(url, params=params, headers=headers, timeout=15)
+
+        if resp.status_code != 200:
+            raise Exception(f"GraphQL returned {resp.status_code}")
+
+        data = resp.json()
+        user = data.get("data", {}).get("user", {})
+
+        if not user:
+            raise Exception("No user data in GraphQL response")
+
+        return {
+            "username": username,
+            "full_name": user.get("full_name", ""),
+            "bio": user.get("biography", ""),
+            "followers": user.get("edge_followed_by", {}).get("count", 0) if "edge_followed_by" in user else user.get("follower_count", 0),
+            "following": user.get("edge_follow", {}).get("count", 0) if "edge_follow" in user else user.get("following_count", 0),
+            "posts": user.get("edge_owner_to_timeline_media", {}).get("count", 0) if "edge_owner_to_timeline_media" in user else user.get("media_count", 0),
+            "is_private": user.get("is_private", False),
+            "is_verified": user.get("is_verified", False),
+            "profile_pic_url": user.get("profile_pic_url_hd", user.get("profile_pic_url", "")),
+        }
+
+    def _fetch_via_html(self, username: str) -> dict:
+        """Fallback: Fetch profile page HTML and parse meta tags."""
+        url = f"https://www.instagram.com/{username}/"
+
+        resp = self.session.get(url, timeout=15)
+
+        if resp.status_code == 404:
+            raise Exception(f"Profile @{username} not found")
+        if resp.status_code != 200:
+            raise Exception(f"Got status {resp.status_code}")
+
+        html = resp.text
+
+        # Extract og:image (profile pic)
+        profile_pic_url = ""
+        og_match = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
+        if og_match:
+            profile_pic_url = og_match.group(1).replace("&amp;", "&")
+
+        # Extract title for full name
+        full_name = ""
+        title_match = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html)
+        if title_match:
+            name_match = re.match(r"^(.*?)\s*\(@", title_match.group(1))
+            if name_match:
+                full_name = name_match.group(1).strip()
+
+        # Extract description for counts
+        followers, following, posts = 0, 0, 0
+        desc_match = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
+        if desc_match:
+            desc = desc_match.group(1)
+            f_match = re.search(r"([\d,.]+[KMB]?)\s*Followers", desc, re.IGNORECASE)
+            fw_match = re.search(r"([\d,.]+[KMB]?)\s*Following", desc, re.IGNORECASE)
+            p_match = re.search(r"([\d,.]+[KMB]?)\s*Posts", desc, re.IGNORECASE)
+            if f_match:
+                followers = parse_count(f_match.group(1))
+            if fw_match:
+                following = parse_count(fw_match.group(1))
+            if p_match:
+                posts = parse_count(p_match.group(1))
+
+        if not profile_pic_url:
+            raise Exception("Could not find profile pic in HTML")
+
+        return {
+            "username": username,
+            "full_name": full_name,
+            "bio": "",
+            "followers": followers,
+            "following": following,
+            "posts": posts,
+            "is_private": False,
+            "is_verified": False,
+            "profile_pic_url": profile_pic_url,
+        }
 
 
 def parse_count(value: str) -> int:
-    """Parse Instagram count strings like '1.2M', '500K', '1,234'."""
+    """Parse count strings like '1.2M', '500K', '1,234'."""
     value = value.strip().replace(",", "")
     multiplier = 1
     if value.upper().endswith("K"):
@@ -189,26 +312,38 @@ def parse_count(value: str) -> int:
         return 0
 
 
-def download_image(url: str, username: str) -> str | None:
-    """Download the profile image from Instagram's CDN."""
-    try:
-        resp = session.get(url, timeout=15)
-        if resp.status_code == 200:
-            dest_path = os.path.join(SAVE_DIR, f"{username}_profile_pic.jpg")
-            with open(dest_path, "wb") as f:
-                f.write(resp.content)
-            return dest_path
-    except Exception as e:
-        print(f"Failed to download image: {e}")
-    return None
+# ============================================================
+# Global session instance
+# ============================================================
+ig_session = InstagramSession()
 
 
-# === ROUTES ===
+@app.on_event("startup")
+def startup():
+    """Login to Instagram on app startup."""
+    ig_user = os.environ.get("IG_USERNAME")
+    ig_pass = os.environ.get("IG_PASSWORD")
+
+    if ig_user and ig_pass:
+        success = ig_session.login(ig_user, ig_pass)
+        if success:
+            print(f"🎉 App started with authenticated session (@{ig_user})")
+        else:
+            print("⚠️ Login failed. App will try unauthenticated methods.")
+    else:
+        print("⚠️ No IG credentials. Set IG_USERNAME and IG_PASSWORD env vars.")
+        print("   The app will try to work without login but may be limited.")
+
+
+# ============================================================
+# Routes
+# ============================================================
 
 @app.get("/")
 def root():
     return {
-        "message": "Instagram Profile Photo Downloader API v2",
+        "message": "Instagram Profile Photo Downloader API v3",
+        "logged_in": ig_session.logged_in,
         "usage": "GET /profile/{username}",
         "docs": "Visit /docs for Swagger UI",
     }
@@ -223,12 +358,19 @@ def get_profile(username: str):
         raise HTTPException(status_code=400, detail="Username cannot be empty")
 
     try:
-        data = extract_profile_data(username)
+        data = ig_session.get_profile_data(username)
 
-        # Download the profile pic to local storage
+        # Download the actual profile pic image
         saved_path = None
-        if data["profile_pic_url"]:
-            saved_path = download_image(data["profile_pic_url"], username)
+        if data.get("profile_pic_url"):
+            try:
+                resp = ig_session.session.get(data["profile_pic_url"], timeout=15)
+                if resp.status_code == 200:
+                    saved_path = os.path.join(SAVE_DIR, f"{username}_profile_pic.jpg")
+                    with open(saved_path, "wb") as f:
+                        f.write(resp.content)
+            except Exception as e:
+                print(f"⚠️ Could not download image: {e}")
 
         return {
             "success": True,
@@ -264,4 +406,9 @@ def download_photo(username: str):
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "2.0.0"}
+    return {
+        "status": "healthy",
+        "version": "3.0.0",
+        "logged_in": ig_session.logged_in,
+        "login_user": ig_session.login_username,
+    }
