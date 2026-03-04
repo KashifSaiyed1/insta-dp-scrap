@@ -36,17 +36,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Create virtual environment
+# Create virtual environment and set PATH
 RUN python -m venv /app/venv
+ENV VIRTUAL_ENV=/app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
-# Install Python dependencies inside venv
+# Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN /app/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# Install Chromium browser
-RUN playwright install chromium
-RUN playwright install-deps chromium || true
+# Install Chromium browser (use explicit path)
+RUN /app/venv/bin/python -m playwright install chromium
+RUN /app/venv/bin/python -m playwright install-deps chromium || true
 
 # Copy app code
 COPY main.py .
@@ -55,4 +56,4 @@ RUN mkdir -p profile_photos
 
 EXPOSE 10000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+CMD ["/app/venv/bin/uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
